@@ -1,0 +1,8 @@
+export TEST_REPO=https://accounts.stage.mozaws.net
+export IMG_MOLOTOV=pdehaan/durable-sync
+export TEST_NAME=test
+
+export VERBOSE=-v
+export TEST_PROCESSES=1
+export TEST_DURATION=10
+export TEST_CONNECTIONS=1
