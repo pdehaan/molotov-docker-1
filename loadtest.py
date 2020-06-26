@@ -1,168 +1,57 @@
-import sys; sys.path.append('.')  # NOQA
-import os
-import base64
-import time
-import random
-import json
-
-from storage import StorageClient
-from molotov import setup_session, scenario
-
-
-_PAYLOAD = """\
-This is the metaglobal payload which contains
-some client data that doesnt look much
-like this
+""" Molotov-based test.
 """
-_WEIGHTS = {'metaglobal': [40, 60, 0, 0, 0],
-            'distribution': [80, 15, 4, 1],
-            'count_distribution': [71, 15, 7, 4, 3],
-            'post_count_distribution': [67, 18, 9, 4, 2]}
-
-_PROBS = {'get': .1, 'post': .2}
-_COLLS = ['bookmarks', 'forms', 'passwords', 'history', 'prefs']
-_BATCH_MAX_COUNT = 100
+import json
+from molotov import scenario, setup, global_setup, teardown, global_teardown
 
 
-def should_do(name):
-    return random.random() <= _PROBS[name]
+# This is the service you want to load test
+_API = "http://104.199.125.107"
 
 
-def get_num_requests(name):
-    weights = _WEIGHTS['metaglobal']
-    i = random.randint(1, sum(weights))
-    count = 0
-    base = 0
-    for weight in weights:
-        base += weight
-        if i <= base:
-            break
-        count += 1
-    return count
+@global_setup()
+def test_starts(args):
+    """ This functions is called before anything starts.
+
+    Notice that it's not a coroutine.
+    """
+    pass
 
 
-@setup_session()
-async def _session(worker_num, session):
-    exc = []
+@setup()
+async def worker_starts(worker_id, args):
+    """ This function is called once per worker.
 
-    def _run():
-        try:
-            session.storage = StorageClient(session)
-        except Exception as e:
-            exc.append(e)
+    If it returns a mapping, it will be used with all requests.
 
-    # XXX code will be migrated to Molotov
-    # see https://github.com/loads/molotov/issues/100
-    import threading
-    t = threading.Thread(target=_run)
-    t.start()
-    t.join()
-    if len(exc) > 0:
-        raise exc[0]
+    You can add things like Authorization headers for instance,
+    by setting a "headers" key.
+    """
+    headers = {"SomeHeader": "1"}
+    return {"headers": headers}
 
 
-@scenario(1)
-async def test(session):
-    storage = session.storage
+@teardown()
+def worker_ends(worker_id):
+    """ This functions is called when the worker is done.
 
-    # Always GET info/collections
-    # This is also a good opportunity to correct for timeskew.
-    url = "/info/collections"
-    await storage.get(url, (200, 404))
+    Notice that it's not a coroutine.
+    """
+    pass
 
-    # GET requests to meta/global
-    num_requests = get_num_requests('metaglobal')
-    url = "/storage/meta/global"
 
-    for x in range(num_requests):
-        resp, __ = await storage.get(url, (200, 404))
-        if resp.status == 404:
-            data = json.dumps({"id": "global", "payload": _PAYLOAD})
-            await storage.put(url, data=data, statuses=(200,))
+@global_teardown()
+def test_ends():
+    """ This functions is called when everything is done.
 
-    # Occasional reads of client records.
-    if should_do('get'):
-        url = "/storage/clients"
-        newer = int(time.time() - random.randint(3600, 360000))
-        params = {"full": "1", "newer": str(newer)}
-        await storage.get(url, params=params, statuses=(200, 404))
+    Notice that it's not a coroutine.
+    """
+    pass
 
-    # Occasional updates to client records.
-    if should_do('post'):
-        cid = str(get_num_requests('distribution'))
-        url = "/storage/clients"
-        wbo = {'id': 'client' + cid, 'payload': cid * 300}
-        data = json.dumps([wbo])
-        resp, result = await storage.post(url, data=data, statuses=(200,))
-        assert len(result["success"]) == 1
-        assert len(result["failed"]) == 0
 
-    # GET requests to individual collections.
-    num_requests = get_num_requests('count_distribution')
-    cols = random.sample(_COLLS, num_requests)
-    for x in range(num_requests):
-        url = "/storage/" + cols[x]
-        newer = int(time.time() - random.randint(3600, 360000))
-        params = {"full": "1", "newer": str(newer)}
-        await storage.get(url, params=params, statuses=(200, 404))
-
-    # POST requests with several WBOs batched together
-    num_requests = get_num_requests('post_count_distribution')
-    # Let's do roughly 50% transactional batches.
-    transact = random.randint(0, 1)
-    batch_id = None
-    committing = False
-
-    # Collections should be a single static entry if we're "transactional"
-    if transact:
-        col = random.sample(_COLLS, 1)[0]
-        cols = [col for x in range(num_requests)]
-    else:
-        cols = random.sample(_COLLS, num_requests)
-
-    for x in range(num_requests):
-        url = "/storage/" + cols[x]
-        data = []
-        # Random batch size, skewed slightly towards the upper limit.
-        items_per_batch = min(random.randint(20, _BATCH_MAX_COUNT + 80),
-                              _BATCH_MAX_COUNT)
-        for i in range(items_per_batch):
-            randomness = os.urandom(10)
-            id = base64.urlsafe_b64encode(randomness).rstrip(b"=")
-            id = id.decode('utf8')
-            id += str(int((time.time() % 100) * 100000))
-            # Random payload length.  They can be big, but skew small.
-            # This gives min=300, mean=450, max=7000
-            payload_length = min(int(random.paretovariate(3) * 300), 7000)
-
-            # XXX should be in the class
-            token = storage.auth_token.decode('utf8')
-            payload_chunks = int((payload_length / len(token)) + 1)
-            payload = (token * payload_chunks)[:payload_length]
-            wbo = {'id': id, 'payload': payload}
-            data.append(wbo)
-
-        data = json.dumps(data)
-        status = 200
-        if transact:
-            # Batch uploads only return a 200 on commit.  An Accepted(202)
-            # is returned for batch creation & appends
-            status = 202
-            if x == 0:
-                committing = False
-                url += "?batch=true"
-            elif x == num_requests - 1:
-                url += "?commit=true&batch=%s" % batch_id
-                committing = True
-                batch_id = None
-                status = 200
-            else:
-                url += "?batch=%s" % batch_id
-
-        resp, result = await storage.post(url, data=data, statuses=(status,))
-        assert len(result["success"]) == items_per_batch, result
-        assert len(result["failed"]) == 0, result
-
-        if transact and not committing:
-            batch_id = result["batch"]
-
+# all scenarii are coroutines
+@scenario(weight=30)
+async def scenario_two(session):
+    # a call to one of the session method should be awaited
+    # see aiohttp.Client docs for more info on this
+    async with session.get(_API) as resp:
+        assert resp.status == 200
